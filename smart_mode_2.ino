@@ -2,13 +2,10 @@
 #include <ESP8266WiFi.h>
 #define LED_BUILTIN 2
 
-//const char* ssid     = "Alex";
-//const char* password = "INeedConnect";EW11_A55A
 const char* ssid     = "EW11_A55A";
 const char* password = "INeedConnect";
 const uint16_t tcpPort = 8899;
 unsigned char machineAddress = 0x06;
-//IPAddress server(192, 168, 88, 23);
 IPAddress server(10, 10, 100, 254);
 WiFiClient tcpClient;
 
@@ -603,17 +600,13 @@ void loop() {
   03 Floating charging
   04 Balanced charging
 */
-//Battery temperature 0x1014 1C
-//Battery temperature compensation voltage point 0x1013 1mV
-//Active power 0x1010 1W
 
 /*
-
    PV panel voltage 0x1020  33
    Total PV charging current 0x1022   34
   //Mode is Smart mode
   //OPEN invertor when sun is raise
-  //PV charge > 80W
+  //PV charge > 150W
   06 18 10 37 00 83 D4 D0  //N09=13.1 default val
   06 18 10 38 00 76 24 94  //N10=11.8 discharge  limit at day
   After opening the machine will be in floating charge state near one hour
@@ -621,7 +614,7 @@ void loop() {
 
 
   //CLOSE invertor at night coming
-  //PV charge < 50W
+  //PV charge < 150W
   06 18 10 38 00 82 25 13 //N09=15.0 can't reach this voltage
   06 18 10 37 00 96 15 1F //N10=13.0 discharge limit at night
   after night set the machine will raise E10 immediatly and
@@ -632,51 +625,4 @@ void loop() {
   //mains AC lost condition
   06 18 10 37 00 83 D4 D0  //N09=13.1 default val
   06 18 10 38 00 6C A5 5F  //N10=10.8 discharge limit if cutoff the mains AC
-  uint8_t d1=0x01;
-  uint8_t d2=0x02;
-  uint16_t wd = (d2 << 8) | d1;
 */
-
-/*  Mode  status in nybble
- * 3 - night Mode
- * 2 - day Mode
- * 1 - AC lost mode
- * 0 - Switch mode permission
- * 
- * 0000 - Deny bit 0
- * 0001 - switch deny bit, another mode (maybe set if inverner has a different mode that Smart) 1
- * 0010 - AC lost mode acive 2
- * 0011 - AC lost mode and deny bit, deny bis is in prirority 3
- * 0100 - Day mode 4
- * 0101 - Day mode and deny bit, deny bis is in prirority 5
- * 0110 - DAY+AC lost mode together. cant exist 6
- * 0111 - DAY+AC+DENY. cant exist 7
- * 1000 - Night mode 8
- * 1001 - Night + and deny bit, deny bis is in prirority 9
- * 1010 - NIGH+AC mode. cant exist A
- * 1011 - NIGH+AC+DENY. cant exist B
- * 1100 - NIGH+DAY cant exist C
- * 1101 - NIGH+DAY+DENY. cant exist D
- * 1110 - N+D+A mode together. cant exist E
- * 1111 - starting point F
- * 
- * 
- * 
- * day mode, ac exis
- *  Mode Change params in nybble
- * 3 - reserver
- * 2 - Day mode prepared
- * 1 - Night mode prepared
- * 0 - AC lost mode prepared
-
- * 1 000 - starting point 0
- * 1 001 - AC prep 1
- * 1 010 - Night prep 2
- * 1 011 - N+A prepared. cant exist 3
- * 1 100 - Day  prem 4
- * 1 101 - Day+AC prep. cant exist 5
- * 1 110 - D+N prep. cant exist 6
- * 1 111 - D+N+L prep. cant exist 7
- * 
- * 
- */

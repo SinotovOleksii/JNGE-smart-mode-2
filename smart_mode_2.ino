@@ -1,572 +1,315 @@
-#include <FastCRC.h>
 #include <ESP8266WiFi.h>
+#include "config.h"
+#include "state.h"
+#include "blinker.h"
+#include "tcp_link.h"
+#include "jnge.h"
+
 #define LED_BUILTIN 2
 
-const char* ssid     = "EW11_A55A";
-const char* password = "INeedConnect";
-const uint16_t tcpPort = 8899;
-unsigned char machineAddress = 0x06;
-IPAddress server(10, 10, 100, 254);
+enum class Mode : uint8_t { ACLOST, NIGHT, DAY };
+
+State st;
 WiFiClient tcpClient;
-
-//system values
-const int loopTimer = 60000; //ms, timer to start read the params
-const int blinkTimer = 10000; //ms, timer to blink
-unsigned long curMillis = millis(); //for loop pause
-
-//device parameters
-float currentInverterOffVoltage, currentInverterOnVoltage; //current values of voltage
-float bypassUndervoltageProtection, bypassOvervoltageProtection; //current values of bypass protection
-float activePower; // active output power of the inverter
-
-//battery parameters
-const int batteryString = 2; //day night mode battery voltage limits and mains AC lost condition
-const int nightInverterOffVoltage = 130 * batteryString; //multiplied by 10 (0.1V)
-const int nightInverterOnVoltage = 150 * batteryString;
-const int dayInverterOffVoltage = 115 * batteryString;
-const int dayInverterOnVoltage = 131 * batteryString;
-const int lostAcInverterOffVoltage = 111 * batteryString;
-const int lostAcInverterOnVoltage = 131 * batteryString;
-const int lowPowerInverterOffVoltage = 124 * batteryString;
+//TcpLink link(tcpClient, IPAddress(10,10,100,254), TCP_PORT);
+TcpLink link(tcpClient, IPAddress(192,168,88,254), TCP_PORT);
+Blinker led(LED_BUILTIN, true);
+GNFL jnge(MACHINE_ADDR, tcpClient);
 
 
-//variables for modes control
-const float minPVpower = 150.0; //min power from PV
-const float minPVvoltage = 88.0; //min voltage on PV array
-const float minBatteryVoltage = 13.1 * batteryString; //min battery volatge to start count the night mode
-
-//Day
-const int startDayModeDelay = 10; //pauses to change mode
-
-//Night
-const int startNightModeDelay = 15; //pauses to change mode
-
-//AC lost
-const int AcLostModeDelay = 3; //pauses to change mode
-
-//mode relating params
-int currentNightModeDelay = 0; //counters for mode switching
-int currentDayModeDelay = 0; //counters for mode switching
-bool nightModeIsSet = false; //mode day/night
-int currentAcLostModeDelay = 0; //counters for mode switching
-bool mainsAcLostMode = false; //mains AC state
-bool mainsAcIsLost = false; //AC realtime status need get from device
-
-
-
-
-void blinker(int blinkCount, int delayON, int delayOFF){
-  digitalWrite(LED_BUILTIN, HIGH);
-  for (int i = 1; i <= blinkCount; i++) {
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(delayON);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(delayOFF);
-  }
-  
-}
-
-void checkClientConnection(WiFiClient* tcpClient) {
-  while ( !tcpClient->connected() ) {
-    Serial.print("Connecting to server ");
-    Serial.println(server);
-    if (!tcpClient->connect(server, tcpPort)) {
-      Serial.println("Connection failed!");
-      Serial.printf("Wifi status: %d", WiFi.status());
-      Serial.print(" RRSI: ");
-      Serial.println(WiFi.RSSI());
-      delay(3000);
-    } else { 
-      Serial.println("Connected to server.");
-      delay(1000);
-    }
-  }
-  Serial.printf("Connected to the server: ");
-  Serial.print(tcpClient->remoteIP());
-  Serial.printf(":%d ", tcpClient->remotePort());
-  Serial.printf("Wifi status: %d", WiFi.status());
-  Serial.print(" RRSI: ");
-  Serial.println(WiFi.RSSI());
-}
-
-class JNGEdevice {
-
-  public:
-    FastCRC16 CRC16;
-    unsigned char* lastResponse;
-    int sizeOfResponse;
-    JNGEdevice(unsigned char addr, WiFiClient* clnt) {
-      machineAddrr = addr;
-      jngeClient = clnt;
-      lastResponse = 0;
-      sizeOfResponse = 0;
-    };
-
-    bool sendCommand(unsigned char* cmd, int cmdSize, uint8_t addr, uint16_t value) { //send cmd and save response addr=machine address, value=dword param
-      if (jngeClient->connected()) {
-        //transform value to bytes and set machine addr
-        uint8_t b1 = value >> 8;
-        uint8_t b2 = value & 0x00FF;
-        cmd[4] = b1;
-        cmd[5] = b2;
-        cmd[0] = addr;
-        //calc crc
-        uint16_t crc = calcCRC16(cmd, cmdSize - 2);
-        cmd[7] = crc >> 8;
-        cmd[6] = crc & 0x00FF;
-        if (!checkCRCresponse(cmd, cmdSize)){
-          Serial.println("Abort sending the command. CRC error");
-          return false;
-        }
-        Serial.print("Send command: ");
-        printData(cmd, cmdSize);
-        jngeClient->flush();
-        while (jngeClient->available()) {
-          jngeClient->read();
-        }
-        jngeClient->write(cmd, cmdSize);
-        unsigned long timeout = millis(); //check exist of the response
-        while (jngeClient->available() == 0) {
-          if (millis() - timeout > 2000) {
-            Serial.println("TCP Client Timeout !");
-            jngeClient->stop();
-            return false;
-          }
-        }
-        int response = jngeClient->available();
-        unsigned char arrResp[response];
-        if (response > 0) {
-          int sumNotZero = 0;
-          for (int i = 0; i < response; i++) {
-            arrResp[i] = jngeClient->read();
-            sumNotZero += arrResp[i];
-          }
-          if (checkCRCresponse(arrResp, sizeof(arrResp)) && sumNotZero) {
-            lastResponse = arrResp;
-            sizeOfResponse = sizeof(arrResp);
-            Serial.println("Response is: ");
-            printData(arrResp, sizeof(arrResp));
-            return true;
-          } else {
-            lastResponse = 0;
-            sizeOfResponse = 0;
-            return false;
-          }
-        }
-      }
-      return false;
-    }
-
-    float getParam(unsigned char* dataArr, int arrSize, uint16_t startAddr, uint16_t paramAddr, float coefficient, const char* caption) {
-      uint8_t b1, b2;
-      int addr1, addr2;
-      addr1 = ((int)paramAddr - startAddr) * 2 + 7;
-      addr2 = ((int)paramAddr - startAddr) * 2 + 8;
-      if (addr1 >= arrSize || addr2 >= arrSize) {
-        Serial.println("Error in param address.");
-        return 0.0;
-      }
-      b1 = dataArr[addr1];
-      b2 = dataArr[addr2];
-      uint16_t wd = ((uint16_t)b1 << 8) | b2;
-      if (caption != "") {
-      Serial.print(caption);
-      //Serial.printf(": b1:%X", b1);
-      //Serial.printf(",b2:%X" , b2);     
-      //Serial.printf(",addr:0x%X", paramAddr);
-      Serial.printf(",world:0x%X", wd);
-      Serial.printf(",data:%4.2f\n", wd * coefficient);
-      }
-      return wd * coefficient;
-    }
-
-    void printData(unsigned char *dataArr, int arrSize) {
-      Serial.print("\r\n-------print-data-------\r\n");
-      for (int i = 0; i < arrSize; i++) {
-        Serial.print(dataArr[i], HEX);
-        Serial.print(( i + 1 ) % 16 == 0 ? "\r\n" : " ");
-      }
-      Serial.print("\r\n-------end--print-------\r\n");
-    }
-
-    uint16_t calcCRC16(unsigned char *dataArr, int arrSize) {
-      uint16_t crc = CRC16.modbus(dataArr, arrSize);
-      //Serial.print("CRC calculated: 0x");
-      //Serial.println(crc , HEX );
-      return crc;
-    }
-
-    bool checkCRCresponse(unsigned char *dataArr, int arrSize) {
-      uint16_t crc = CRC16.modbus(dataArr, arrSize - 2);
-      uint8_t bite2 = crc >> 8;
-      uint8_t bite1 = crc & 0x00FF;
-      if (bite1 == dataArr[arrSize - 2] && bite2 == dataArr[arrSize - 1]) {
-        //Serial.println("CRC check OK");
-        return true;
-      } else {
-        Serial.println("CRC check ERROR");
-        return false;
-      }
-    }
-
-    unsigned char getMachineAddr(){
-      return machineAddrr;
-    }
-    
-
-
-  protected:
-    WiFiClient* jngeClient;    
-    unsigned char machineAddrr;
-};
-
-class GNFL : public JNGEdevice {
- public:
-    unsigned char runningParameters[81];
-    unsigned char basicParameters[87];
-    
-    GNFL(unsigned char addr, WiFiClient* clnt) : JNGEdevice(addr, clnt){
-      //init commands and their crc
-      uint16_t crc;
-      cmdReadRunningParameters[0] = machineAddrr;
-      crc = calcCRC16(cmdReadRunningParameters, sizeof(cmdReadRunningParameters) - 2);
-      cmdReadRunningParameters[7] = crc >> 8;
-      cmdReadRunningParameters[6] = crc & 0x00FF;
-      cmdReadBasicParameters[0] = machineAddrr;
-      crc = calcCRC16(cmdReadBasicParameters, sizeof(cmdReadBasicParameters) - 2);
-      cmdReadBasicParameters[7] = crc >> 8;
-      cmdReadBasicParameters[6] = crc & 0x00FF;
-      //init error response
-      
-    }
-
-    
-    
-    bool readBasicParams() { //read basic params and save it to obj
-      int response;
-      //Serial.print("readBasicParams.send cmd: ");
-      if (jngeClient->connected()) {
-        //printData(cmdReadBasicParameters, sizeof(cmdReadBasicParameters));
-        jngeClient->flush();
-        while (jngeClient->available()) {
-          jngeClient->read();  //read all buffers before a cmd
-        }
-        jngeClient->write(cmdReadBasicParameters, 8);
-        unsigned long timeout = millis(); //check exist of the response
-        while (jngeClient->available() == 0) {
-          if (millis() - timeout > 2000) {
-            Serial.println("TCP Client Timeout !");
-            jngeClient->stop();
-            basicParametersIsSet = false;
-            return false;
-          }
-        }
-        response = jngeClient->available();
-        if (response > 0 && response == sizeof(basicParameters)) {
-          int sumNotZero = 0;
-          for (int i = 0; i < response; i++) {
-            basicParameters[i] = jngeClient->read();
-            sumNotZero += basicParameters[i];
-          }
-          if (checkCRCresponse(basicParameters, sizeof(basicParameters)) && sumNotZero) {
-            basicParametersIsSet = true;
-            return true;
-          } else {
-            basicParametersIsSet = false;
-            return false;
-          }
-        } else {
-          Serial.print("Response error, resp size: ");
-          Serial.println(response);
-        }
-      }
-      basicParametersIsSet = false;
-      return false;
-    }
-
-    bool readRunParams() { //read running params and save it to obj
-      int response;
-      //Serial.print("readRunParams.send cmd: ");
-      if (jngeClient->connected()) {
-        //printData(cmdReadRunningParameters, sizeof(cmdReadRunningParameters));
-        jngeClient->flush();
-        while (jngeClient->available()) {
-          jngeClient->read();  //read all buffers before a cmd
-        }
-        jngeClient->write(cmdReadRunningParameters, 8);
-        unsigned long timeout = millis(); //check exist of the response
-        while (jngeClient->available() == 0) {
-          if (millis() - timeout > 2000) {
-            Serial.println("TCP Client Timeout !");
-            jngeClient->stop();
-            runningParametersIsSet = false;
-            return false;
-          }
-        }
-        response = jngeClient->available();
-        if (response > 0 && response == sizeof(runningParameters)) {
-          int sumNotZero = 0;
-          for (int i = 0; i < response; i++) {
-            runningParameters[i] = jngeClient->read();
-            sumNotZero += runningParameters[i];
-          }
-          if (checkCRCresponse(runningParameters, sizeof(runningParameters)) && sumNotZero) {
-            runningParametersIsSet = true;
-            return true;
-          } else {
-            runningParametersIsSet = false;
-            return false;
-          }
-        }  else {
-          Serial.print("Response error, resp size: ");
-          Serial.println(response);
-        }
-      }
-      runningParametersIsSet = false;
-      return false;
-    }
-
-    bool runParamsIsSet() {
-      return runningParametersIsSet;
-    }
-
-    bool basicParamsIsSet() {
-      return basicParametersIsSet;
-    }
-
-    private:
-    bool runningParametersIsSet = false; //if response and crc is ok
-    bool basicParametersIsSet = false; //if response and crc is ok
-    unsigned char cmdReadRunningParameters[8] = {0xFF, 0x12, 0x10, 0x00, 0x00, 0x24, 0xA8, 0xCC};
-    unsigned char cmdReadBasicParameters[8] = {0xFF, 0x16, 0x10, 0x24, 0x00, 0x27, 0x59, 0x06};
-    unsigned char errorResponse[13] = {0xFF, 0xFF, 0x08, 0x24, 0x00, 0x27, 0x59, 0x06};
-};
-
-//the device
-GNFL jnge(machineAddress, &tcpClient);
 
 //commands
 unsigned char cmdN10[] = {0x06, 0x18, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00}; //N10 inverter OFF voltage
 unsigned char cmdN09[] = {0x06, 0x18, 0x10, 0x37, 0x00, 0x00, 0x00, 0x00}; //N09 inverter ON voltage
 
+
+static void scheduleStatusBlink(Blinker& led, const State& st) {
+  // не перебиваємо активний патерн (як у тебе раніше)
+  if (led.active()) return;
+
+  if (st.acLostMode) {
+    led.start(8, 80, 150);
+  } else if (st.nightMode) {
+    led.start(3, 50, 350);
+  } else {
+    led.start(3, 350, 50);
+  }
+}
+
+bool pollDeviceOnce() {
+  // 1) спробуй readRun + readBasic
+  bool ok1 = jnge.readRunParams();
+  bool ok2 = jnge.readBasicParams();
+
+  if (ok1 && ok2) return true;
+
+  // 2) якщо щось не вийшло — м'яко перезапусти TCP і хай ensureConnectedNonBlocking підніме
+  tcpClient.stop();
+  return false;
+}
+void readAll(State& s) {
+  s.batV = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1006, 0.1, "Battery voltage");
+  s.mainsV = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1001, 0.1, "Municipal electric voltage");
+
+  s.invOffRaw = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1038);
+  s.invOnRaw  = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1037);
+
+  s.bypassUv = jnge.getParamF(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1033, 0.1, "Bypass UV");
+  s.bypassOv = jnge.getParamF(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1035, 0.1, "Bypass OV");
+
+  s.activePowerRaw = jnge.getParamRaw(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1010);
+
+  s.pvV = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1020, 0.1, "PV voltage");
+  s.pvP = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1023, 0.1, "PV power");
+}
+
+// --- helpers: what settings should be now ---
+static inline void desiredVoltagesRaw(const State& s, uint16_t& onV, uint16_t& offV) {
+  if (s.acLostMode) { onV = V_ACLOST_ON;  offV = V_ACLOST_OFF;  return; }
+  if (s.nightMode)  { onV = V_NIGHT_ON;   offV = V_NIGHT_OFF;   return; }
+  onV = V_DAY_ON;   offV = V_DAY_OFF;
+}
+
+// --- 1) decide state flags/counters (NO IO here) ---
+void updateModes(State& s) {
+  // detect AC lost/ok
+  const bool acBad = (s.bypassUv > s.mainsV || s.mainsV > s.bypassOv);
+  s.acIsLost = acBad;
+
+  if (acBad) {
+    s.acOkStreak = 0;
+    if (!s.acLostMode) s.acDelay++;      // вхід в acLost
+  } else {
+    if (s.acOkStreak < 255) s.acOkStreak++;
+    s.acDelay = 0;
+  }
+
+  // якщо вже acLostMode — day/night не рахуємо
+  if (s.acLostMode) {
+    s.dayDelay = 0;
+    s.nightDelay = 0;
+    return;
+  }
+
+  // Day preparing
+  if (s.pvP >= MIN_PV_POWER || s.pvV >= MIN_PV_VOLTAGE) {
+    if (s.nightMode && !s.acIsLost) {
+      s.dayDelay++;
+      s.nightDelay = 0;
+      Serial.println("Try to enter day mode.");
+    } else {
+      Serial.println("The Day.");
+      s.nightDelay = 0;
+      s.acOkStreak = 0;
+    }
+  }
+
+  // Night preparing
+  if (s.pvP < MIN_PV_POWER && s.batV <= MIN_BAT_VOLT) {
+    if (!s.nightMode && !s.acIsLost) {
+      s.nightDelay++;
+      s.dayDelay = 0;
+      Serial.println("Try to enter night mode.");
+    } else {
+      Serial.println("The Night.");
+      s.acOkStreak = 0;
+      s.dayDelay = 0;
+    }
+  }
+}
+
+// --- 2) apply mode changes (IO: sendCommand) ---
+void applyModes(State& s) {
+  // enter acLost
+  if (!s.acLostMode && s.acDelay >= AC_LOST_DELAY) {
+      s.acLostMode = true;
+      s.acDelay = 0;
+      s.acOkStreak = 0;
+      Serial.println("-----Enter AC Lost!-----");
+    return; // важливо: після входу не робимо day/night в цьому циклі
+  }
+
+  // exit acLost (AC стабільно нормальний N циклів)
+  if (s.acLostMode && !s.acIsLost && s.acOkStreak >= 3) {
+    s.acLostMode = false;
+    s.acOkStreak = 0;
+    s.acDelay = 0;
+    // після виходу НЕ треба відразу шити day/night тут.
+    // нехай updateModes почне рахувати dayDelay/nightDelay з нуля.
+    Serial.println("-----Exit AC Lost!-----");
+    return;
+  }
+
+  if (s.acLostMode) return; // поки в acLost — не ліземо в day/night
+
+  // Enter Day mode
+  if (s.nightMode && s.dayDelay >= START_DAY_DELAY) {
+      s.nightMode = false;
+      s.dayDelay = 0;
+      s.nightDelay = 0;
+      Serial.println("-----Day mode is set!-----");
+  }
+
+  // Enter Night mode
+  if (!s.nightMode && s.nightDelay >= START_NIGHT_DELAY) {
+      s.nightMode = true;
+      s.dayDelay = 0;
+      s.nightDelay = 0;
+      Serial.println("-----Night mode is set!-----");
+  }
+}
+
+// --- 3) verify and self-heal inverter settings (IO: may sendCommand) ---
+static inline Mode currentMode(const State& s) {
+  if (s.acLostMode) return Mode::ACLOST;
+  if (s.nightMode)  return Mode::NIGHT;
+  return Mode::DAY;
+}
+
+static inline void voltagesForMode(Mode m, uint16_t& onV, uint16_t& offV) {
+  switch (m) {
+    case Mode::ACLOST: onV = V_ACLOST_ON;  offV = V_ACLOST_OFF;  break;
+    case Mode::NIGHT:  onV = V_NIGHT_ON;   offV = V_NIGHT_OFF;   break;
+    case Mode::DAY:    onV = V_DAY_ON;     offV = V_DAY_OFF;     break;
+  }
+}
+
+void verifySettings(State& s) {
+  uint16_t wantOn=0, wantOff=0;
+  voltagesForMode(currentMode(s), wantOn, wantOff);
+  Serial.printf("nightMode=%d acLostMode=%d want(off/on)=%u/%u inv(off/on)=%u/%u\n",
+  st.nightMode, st.acLostMode, wantOff, wantOn, st.invOffRaw, st.invOnRaw);
+  if (s.invOffRaw != wantOff) {
+    Serial.println("Send to fix N10 (Off voltage)");
+    jnge.sendCommand(cmdN10, sizeof(cmdN10), jnge.getMachineAddr(), wantOff);
+  }
+  if (s.invOnRaw != wantOn) {
+    Serial.println("Send to fix N09 (On voltage)");
+    jnge.sendCommand(cmdN09, sizeof(cmdN09), jnge.getMachineAddr(), wantOn);
+  }
+}
+
+void printState(const State& s) {
+  Serial.println(F("----------- STATE -----------"));
+
+  Serial.print(F("Mode: "));
+  if (s.acLostMode)      Serial.println(F("AC_LOST"));
+  else if (s.nightMode)  Serial.println(F("NIGHT"));
+  else                   Serial.println(F("DAY"));
+
+  Serial.print(F("Delays -> dayMode: "));
+  Serial.print(s.dayDelay);
+  Serial.print(F(" | nightMode: "));
+  Serial.print(s.nightDelay);
+  Serial.print(F(" | acLostMode: "));
+  Serial.println(s.acDelay);
+
+  Serial.print(F("Flags -> acLostMode: "));
+  Serial.print(s.acLostMode);
+  Serial.print(F(" | acIsLost: "));
+  Serial.print(s.acIsLost);
+  Serial.print(F(" | acOkStreak: "));
+  Serial.println(s.acOkStreak);
+
+  Serial.print(F("Battery: "));
+  Serial.print(s.batV, 2);
+  Serial.print(F("V | PV: "));
+  Serial.print(s.pvV, 2);
+  Serial.print(F("V / "));
+  Serial.print(s.pvP, 1);
+  Serial.print(F("W | Mains: "));
+  Serial.print(s.mainsV, 2);
+  Serial.println(F("V"));
+
+  Serial.print(F("InvVoltageRaw OFF/ON: "));
+  Serial.print(s.invOffRaw);
+  Serial.print(F(" / "));
+  Serial.println(s.invOnRaw);
+
+  Serial.println(F("-----------------------------"));
+}
+
+//-------------------------------SETUP--------------------------
 void setup() {
   Serial.begin(9600);
   delay(300);
-  
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-  
+
+  led.begin();
+
+  const uint32_t now = millis();
+  st.lastPollMs  = now;   // старт таймера опитування
+  st.lastBlinkMs = now;   // старт таймера блімка
+
   Serial.println();
-  Serial.printf("Connecting to %s\n", ssid);
+  Serial.printf("Connecting to %s\n", WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (!WiFi.isConnected()) {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(300);
   }
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
-  Serial.print("\r\nWiFi connected.  IP address: ");
+
+  Serial.print("\r\nWiFi connected. IP address: ");
   Serial.println(WiFi.localIP());
-  checkClientConnection(&tcpClient);
-  delay(200);
-  Serial.println("Check current mode");
-  if (  jnge.readBasicParams() ) {
-    int offVoltage = currentInverterOffVoltage = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1038, 1, "");
-    int onVoltage = currentInverterOnVoltage = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1037, 1, "");
-    if (offVoltage == nightInverterOffVoltage && onVoltage == nightInverterOnVoltage){
-      Serial.println("Start in night mode");
-      nightModeIsSet = true;
-      blinker(5,100,200);
-    } else {
-      Serial.println("Not in night mode");
-      blinker(2,100,300);
-    }
+
+  // TCP best-effort до 5с
+  uint32_t t0 = millis();
+  while (!link.ensure(200) && (millis() - t0 < 5000UL)) {
+    led.tick();
+    delay(10);
+  }
+
+  if (!tcpClient.connected()) {
+    Serial.println("TCP not connected yet; will retry in loop()");
+    return;
+  }
+
+  Serial.println("Check current mode...");
+  if (jnge.readBasicParams()) {
+    st.invOffRaw = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1038);
+    st.invOnRaw  = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1037);
+    st.nightMode = (st.invOffRaw == V_NIGHT_OFF && st.invOnRaw == V_NIGHT_ON);
+    Serial.println(st.nightMode ? "--Start in night mode" : "--Not in night mode");
+  } else {
+    Serial.println("readBasicParams failed in setup()");
   }
 }
 
-
-
+//-------------------------------LOOP----------------------------
 void loop() {
-  unsigned long prevMillis = millis();
-  if (prevMillis - curMillis < loopTimer) {
-    //blinker
-    if ((prevMillis - curMillis) % 10000 == 0){
-      if (!mainsAcLostMode) {
-        if (nightModeIsSet) {
-            blinker(1,300,200);
-            blinker(2,80,200);
-        } else {
-            blinker(2,80,200); 
-            blinker(1,300,200);
-        }
-      } else {
-        blinker(5,80,150);
-      }
-    }
-    return;
-  }
-  
-  checkClientConnection(&tcpClient);
+  const uint32_t now = millis();
 
-  if (  jnge.readRunParams()  ) {
-    //jnge.printData(jnge.runningParameters, sizeof(jnge.runningParameters));
-    Serial.println("Running params was read");
-  } 
-  if (  jnge.readBasicParams() ) {
-    //jnge.printData(jnge.basicParameters, sizeof(jnge.basicParameters));
-    Serial.println("Basic params was read");
-  }
-  if (!jnge.runParamsIsSet() || !jnge.basicParamsIsSet()) return; 
-  
+  led.tick();                     // завжди
+  link.ensure(200);       // завжди
 
-  float batVoltage, PVpower, mainsVoltage, PVvoltage;
-  float checkOffVoltage, checkOnVoltage;
-  Serial.println("------------Battery's parameters------------------");
-  batVoltage = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1006, 0.1, "Battery voltage");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1014, 0.1, "Battery temperature");
-  //jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1013, 1, "Battery temperature compensation voltage point");
-  //jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x102E, 1, "Temperature compensation factor");
-  Serial.println("------------Inverter and charger status------------");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x100C, 1, "Inverter running state");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1008, 1, "Municipal electric charging status");
-  jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x103F, 0.01, "Municipal electric charge rated current");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x100D, 1, "Inverter internal state");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x101C, 1, "FAILURE CODE 1");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x101D, 1, "FAILURE CODE 2"); 
-  //jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1017, 1, "Rated on the power");
-  Serial.println("------------Settings----------------");
-  jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1029, 0.1, "Floating charge voltage");
-  jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1027, 0.1, "Boost charge voltage");
-  //jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1040, 0.1, "Full of the restart charging voltage");
-  currentInverterOffVoltage = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1038, 1, "Inverse off voltage point N10");
-  currentInverterOnVoltage = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1037, 1, "Inverse open voltage point");
-  bypassUndervoltageProtection = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1033, 0.1, "Bypass voltage undervoltage protection point"); 
-  bypassOvervoltageProtection = jnge.getParam(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1035, 0.1, "Bypass voltage overvoltage protection point");
-  Serial.println("------------Online power parameters----------------");
-  activePower = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1010, 1, "Active power");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1005, 0.01, "Current Inverse current");  
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1019, 0.1, "Voltage level");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1019, 0.01, "Current level");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1009, 0.01, "Municipal electric charging current");
-  mainsVoltage = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1001, 0.1, "Municipal electric voltage");
-
-  Serial.println("------------PV power parameters----------------");
-  //PV params
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1021, 0.1, "Total PV charging curren");
-  PVvoltage = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1020, 0.1, "PV panel voltage");
-  jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1022, 1, "PV charging status");
-  PVpower = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1023, 0.1, "Photovoltaic charging power"); //real power
-  //PVpower = jnge.getParam(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1014, 0.1, "Photovoltaic charging power"); //power from temp sensor))
-
-  
-  //day mode preparing
-  if (PVpower >= minPVpower || PVvoltage >= minPVvoltage) {
-    if (nightModeIsSet && !mainsAcIsLost) { //try to enter in day mode
-      currentDayModeDelay++;
-      currentNightModeDelay = 0;
-      Serial.println("Try to enter day mode.");
-    } else { //else only clear counter of night mode
-      Serial.println("The Day.");
-      currentNightModeDelay = 0;
-    }
-  }
-  //night mode preparing
-  if (PVpower < minPVpower && batVoltage <= minBatteryVoltage) { 
-    if (!nightModeIsSet && !mainsAcIsLost){ //try to enter in night mode
-      currentNightModeDelay++;
-      currentDayModeDelay = 0;
-      Serial.println("Try to enter night mode.");
-    } else { //else only clear counter of day mode
-      Serial.println("The Night.");
-      currentDayModeDelay = 0;
-    }
-  }
-  //AC lost mode preparing
-  if (bypassUndervoltageProtection > mainsVoltage || mainsVoltage > bypassOvervoltageProtection){ 
-    Serial.println("AC is lost.");
-    mainsAcIsLost = true;
-    if (!mainsAcLostMode) {
-      Serial.println("AC is lost. Try to enter mode");
-      currentAcLostModeDelay++;  
-    } 
-  } else {
-    Serial.println("AC in normal range.");
-    mainsAcIsLost = false;
-    currentAcLostModeDelay = 0;
-    if (mainsAcLostMode) mainsAcLostMode = false;
+  // blink tick
+  if (now - st.lastBlinkMs >= BLINK_EVERY_MS) {
+    st.lastBlinkMs = now;
+    scheduleStatusBlink(led, st);
   }
 
-  //switch to AC lost mode it's working in parallel with smartmode 
-  if (!mainsAcLostMode && currentAcLostModeDelay >= AcLostModeDelay) {
-    Serial.println("AC Lost mode. try to program");  
-    if (  jnge.sendCommand(cmdN10, sizeof(cmdN10), jnge.getMachineAddr(), lostAcInverterOffVoltage) && 
-          jnge.sendCommand(cmdN09, sizeof(cmdN09), jnge.getMachineAddr(), lostAcInverterOnVoltage)  ) {  
-      mainsAcLostMode = !mainsAcLostMode;
-      currentAcLostModeDelay = 0;
-      //night day mode
-      Serial.println("-----AC lost mode is set!-----");
-    }
-  }
-  //switch to day mode
-  if (nightModeIsSet && currentDayModeDelay >= startDayModeDelay) {
-    Serial.println("Day mode. try to program");
-    if (  jnge.sendCommand(cmdN10, sizeof(cmdN10), jnge.getMachineAddr(), dayInverterOffVoltage) && 
-          jnge.sendCommand(cmdN09, sizeof(cmdN09), jnge.getMachineAddr(), dayInverterOnVoltage)  ) {
-      nightModeIsSet = !nightModeIsSet;
-      currentDayModeDelay = 0;
-      currentNightModeDelay = 0;
-      Serial.println("-----Day mode is set!-----");
-    }
-  }
-  //switch to night mode
-  if (!nightModeIsSet && currentNightModeDelay >= startNightModeDelay) {
-    Serial.println("Night mode. try to program");
-    if (  jnge.sendCommand(cmdN10, sizeof(cmdN10), jnge.getMachineAddr(), nightInverterOffVoltage) && 
-        jnge.sendCommand(cmdN09, sizeof(cmdN09), jnge.getMachineAddr(), nightInverterOnVoltage)  ) {
-      nightModeIsSet = !nightModeIsSet;
-      currentDayModeDelay = 0;
-      currentNightModeDelay = 0;
-      Serial.println("-----Night mode is set!-----");
-    }
-  }
-  //check if parameters have written correctly
-  if (nightModeIsSet && !mainsAcLostMode) {
-    checkOnVoltage = nightInverterOnVoltage;
-    checkOffVoltage = nightInverterOffVoltage;
-  } 
-  if (!nightModeIsSet && !mainsAcLostMode) {
-    checkOnVoltage = dayInverterOnVoltage;
-    checkOffVoltage = dayInverterOffVoltage;
-  } 
-  if (mainsAcLostMode) {
-    checkOnVoltage = lostAcInverterOnVoltage;
-    checkOffVoltage = lostAcInverterOffVoltage;
-  }
-  //check inverter settings
-  if (checkOnVoltage && checkOffVoltage) {
-    if (currentInverterOffVoltage == checkOffVoltage){
-      Serial.println("The InverterOff parameter is correct.");
-    } else { //try to set params
-      Serial.println("The InverterOff parameter is incorrect.");
-      jnge.sendCommand(cmdN10, sizeof(cmdN10), jnge.getMachineAddr(), checkOffVoltage);
-    }
-    if (currentInverterOnVoltage == checkOnVoltage){
-      Serial.println("The InverterOn parameter is correct.");
-    } else { //try to set params
-      Serial.println("The InverterOn parameter is incorrect.");
-      jnge.sendCommand(cmdN09, sizeof(cmdN09), jnge.getMachineAddr(), checkOnVoltage);
-    }      
-  }    
-  Serial.printf("--- nightModeIsSet:%d ---", nightModeIsSet);
-  Serial.printf(" currentNightModeDelay:%d ---", currentNightModeDelay);
-  Serial.printf(" currentDayModeDelay:%d ---\n", currentDayModeDelay);
-  Serial.printf("--- mainsAcLostMode:%d ---", mainsAcLostMode);
-  Serial.printf(" currentAcLostModeDelay:%d ---\n", currentAcLostModeDelay);
-  
-  curMillis = millis(); //must be the latest sentance
-};
+  if (!tcpClient.connected()) return;
+
+  // poll tick (стабільний)
+  if (now - st.lastPollMs < LOOP_TIMER_MS) return;
+  st.lastPollMs += LOOP_TIMER_MS;
+
+  if (!pollDeviceOnce()) return;
+
+  // далі: read -> compute -> act
+
+  //printState(st); //print state
+  readAll(st);        // зчитав, заповнив st.*
+  updateModes(st);    // по st.pvP/st.pvV/st.batV/st.mainsV вирішив флаги/лічильники
+  applyModes(st);     // якщо треба — sendCommand(...)
+  verifySettings(st); // якщо треба — переписати N09/N10
+  printState(st); //print state
+}
+
+
 
 
 //Full of the restart charging voltage  0x1040.

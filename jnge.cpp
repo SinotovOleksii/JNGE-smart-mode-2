@@ -192,17 +192,10 @@ bool GNFL::readBasicParams() {
   while (client_.available()) client_.read();
   client_.write(cmdReadBasicParameters_, 8);
 
-  //debug
-  //Serial.println("req readBasicParams");
-  //printData(cmdReadBasicParameters_, 8);
-
   if (!readExactRetry(basicParameters, sizeof(basicParameters), 2000, 2)) {
     basicParametersIsSet_ = false;
     return false;
   }
-  //debug
-  //Serial.println("resp readBasicParams");
-  //printData(basicParameters, sizeof(basicParameters));
 
   if (basicParameters[0] != machineAddr_) { basicParametersIsSet_ = false; return false; }
   if (!checkCRCresponse(basicParameters, (int)sizeof(basicParameters))) { basicParametersIsSet_ = false; return false; }
@@ -216,18 +209,11 @@ bool GNFL::readRunParams() {
 
   while (client_.available()) client_.read();
   client_.write(cmdReadRunningParameters_, 8);
-  //debug
-  //Serial.println("req readRunParams");
-  //printData(cmdReadRunningParameters_, 8);
 
   if (!readExactRetry(runningParameters, sizeof(runningParameters), 1200, 2)) {
     runningParametersIsSet_ = false;
     return false;
   }
-
-  //debug
-  //Serial.println("resp readRunParams");
-  //printData(runningParameters, sizeof(runningParameters));
 
   if (runningParameters[0] != machineAddr_) { runningParametersIsSet_ = false; return false; }
   if (!checkCRCresponse(runningParameters, (int)sizeof(runningParameters))) { runningParametersIsSet_ = false; return false; }

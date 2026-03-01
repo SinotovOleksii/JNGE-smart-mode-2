@@ -4,15 +4,14 @@
 
 
 // WiFi / TCP
-//constexpr const char* WIFI_SSID = "EW11_A55A";
-constexpr const char* WIFI_SSID = "Alex";
+constexpr const char* WIFI_SSID = "EW11_A55A";
 constexpr const char* WIFI_PASS = "INeedConnect";
 constexpr uint16_t TCP_PORT = 8899;
 constexpr uint8_t  MACHINE_ADDR = 0x06;
 
 // Timers
-constexpr uint32_t LOOP_TIMER_MS  = 20000UL;
-constexpr uint32_t BLINK_EVERY_MS = 5000UL;
+constexpr uint32_t LOOP_TIMER_MS  = 60000UL;
+constexpr uint32_t BLINK_EVERY_MS = 10000UL;
 
 // Battery setup
 constexpr int BATTERY_STRING = 2;
@@ -33,4 +32,3 @@ constexpr uint16_t V_NIGHT_ON  = 150 * BATTERY_STRING;
 constexpr uint16_t V_DAY_OFF   = 115 * BATTERY_STRING;
 constexpr uint16_t V_DAY_ON    = 131 * BATTERY_STRING;
 constexpr uint16_t V_ACLOST_OFF = 111 * BATTERY_STRING;
-constexpr uint16_t V_ACLOST_ON  = 125 * BATTERY_STRING;

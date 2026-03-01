@@ -1,7 +1,6 @@
 #pragma once
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-//#include <FastCRC.h>
 #include "Crc16.h"
 
 class JNGEdevice {
@@ -43,7 +42,6 @@ public:
 protected:
   WiFiClient& client_;
   uint8_t machineAddr_;
-  //FastCRC16 CRC16_;
   Crc16 CRC16_;
 };
 

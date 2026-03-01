@@ -11,8 +11,7 @@ enum class Mode : uint8_t { ACLOST, NIGHT, DAY };
 
 State st;
 WiFiClient tcpClient;
-//TcpLink link(tcpClient, IPAddress(10,10,100,254), TCP_PORT);
-TcpLink link(tcpClient, IPAddress(192,168,88,254), TCP_PORT);
+TcpLink link(tcpClient, IPAddress(10,10,100,254), TCP_PORT);
 Blinker led(LED_BUILTIN, true);
 GNFL jnge(MACHINE_ADDR, tcpClient);
 
@@ -23,30 +22,27 @@ unsigned char cmdN10[] = {0x06, 0x18, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00}; //N10
 unsigned char cmdN09[] = {0x06, 0x18, 0x10, 0x37, 0x00, 0x00, 0x00, 0x00}; //N09 inverter ON voltage
 
 
-static void scheduleStatusBlink(Blinker& led, const State& st) {
-  // не перебиваємо активний патерн (як у тебе раніше)
+static void scheduleStatusBlink(Blinker& led, Mode m) {
+  // не перебиваємо активний патерн
   if (led.active()) return;
 
-  if (st.acLostMode) {
-    led.start(8, 80, 150);
-  } else if (st.nightMode) {
-    led.start(3, 50, 350);
-  } else {
-    led.start(3, 350, 50);
+  switch (m) {
+    case Mode::ACLOST: led.start(8, 80, 150);  break;
+    case Mode::NIGHT:  led.start(3, 50, 350);   break;
+    case Mode::DAY:    led.start(3, 350, 50);     break;
   }
 }
 
 bool pollDeviceOnce() {
-  // 1) спробуй readRun + readBasic
   bool ok1 = jnge.readRunParams();
   bool ok2 = jnge.readBasicParams();
 
   if (ok1 && ok2) return true;
 
-  // 2) якщо щось не вийшло — м'яко перезапусти TCP і хай ensureConnectedNonBlocking підніме
   tcpClient.stop();
   return false;
 }
+
 void readAll(State& s) {
   s.batV = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1006, 0.1, "Battery voltage");
   s.mainsV = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1001, 0.1, "Municipal electric voltage");
@@ -63,12 +59,6 @@ void readAll(State& s) {
   s.pvP = jnge.getParamF(jnge.runningParameters, sizeof(jnge.runningParameters), 0x1000, 0x1023, 0.1, "PV power");
 }
 
-// --- helpers: what settings should be now ---
-static inline void desiredVoltagesRaw(const State& s, uint16_t& onV, uint16_t& offV) {
-  if (s.acLostMode) { onV = V_ACLOST_ON;  offV = V_ACLOST_OFF;  return; }
-  if (s.nightMode)  { onV = V_NIGHT_ON;   offV = V_NIGHT_OFF;   return; }
-  onV = V_DAY_ON;   offV = V_DAY_OFF;
-}
 
 // --- 1) decide state flags/counters (NO IO here) ---
 void updateModes(State& s) {
@@ -166,9 +156,12 @@ static inline Mode currentMode(const State& s) {
   return Mode::DAY;
 }
 
-static inline void voltagesForMode(Mode m, uint16_t& onV, uint16_t& offV) {
+static inline void voltagesForMode(Mode m, const State& s, uint16_t& onV, uint16_t& offV) {
   switch (m) {
-    case Mode::ACLOST: onV = V_ACLOST_ON;  offV = V_ACLOST_OFF;  break;
+    case Mode::ACLOST: {
+      onV = (s.batV - 0.5) * 10;  offV = V_ACLOST_OFF;  //battery  depend voltage
+      break;
+    }
     case Mode::NIGHT:  onV = V_NIGHT_ON;   offV = V_NIGHT_OFF;   break;
     case Mode::DAY:    onV = V_DAY_ON;     offV = V_DAY_OFF;     break;
   }
@@ -176,7 +169,7 @@ static inline void voltagesForMode(Mode m, uint16_t& onV, uint16_t& offV) {
 
 void verifySettings(State& s) {
   uint16_t wantOn=0, wantOff=0;
-  voltagesForMode(currentMode(s), wantOn, wantOff);
+  voltagesForMode(currentMode(s), s, wantOn, wantOff);
   Serial.printf("nightMode=%d acLostMode=%d want(off/on)=%u/%u inv(off/on)=%u/%u\n",
   st.nightMode, st.acLostMode, wantOff, wantOn, st.invOffRaw, st.invOnRaw);
   if (s.invOffRaw != wantOff) {
@@ -268,13 +261,12 @@ void setup() {
   }
 
   Serial.println("Check current mode...");
-  if (jnge.readBasicParams()) {
-    st.invOffRaw = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1038);
-    st.invOnRaw  = jnge.getParamRaw(jnge.basicParameters, sizeof(jnge.basicParameters), 0x1024, 0x1037);
+  if (pollDeviceOnce()) {
+    readAll(st);
     st.nightMode = (st.invOffRaw == V_NIGHT_OFF && st.invOnRaw == V_NIGHT_ON);
     Serial.println(st.nightMode ? "--Start in night mode" : "--Not in night mode");
   } else {
-    Serial.println("readBasicParams failed in setup()");
+    Serial.println("Startup setup() failed");
   }
 }
 
@@ -288,7 +280,7 @@ void loop() {
   // blink tick
   if (now - st.lastBlinkMs >= BLINK_EVERY_MS) {
     st.lastBlinkMs = now;
-    scheduleStatusBlink(led, st);
+    scheduleStatusBlink(led, currentMode(st));
   }
 
   if (!tcpClient.connected()) return;
@@ -303,9 +295,9 @@ void loop() {
 
   //printState(st); //print state
   readAll(st);        // зчитав, заповнив st.*
-  updateModes(st);    // по st.pvP/st.pvV/st.batV/st.mainsV вирішив флаги/лічильники
-  applyModes(st);     // якщо треба — sendCommand(...)
-  verifySettings(st); // якщо треба — переписати N09/N10
+  updateModes(st);    // тікаються лічильники
+  applyModes(st);     // змінили режим по лічильникам
+  verifySettings(st); // переписати N09/N10, якщо поточні не відповідають режиму
   printState(st); //print state
 }
 
